@@ -17,8 +17,11 @@ SCOPES = [
 ]
 
 
+from datetime import datetime, timedelta
+
 def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    korea_time = datetime.utcnow() + timedelta(hours=9)
+    return korea_time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def to_int(value):
