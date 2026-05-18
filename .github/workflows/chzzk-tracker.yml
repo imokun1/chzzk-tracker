@@ -2,8 +2,12 @@ name: CHZZK Tracker
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
 
 jobs:
   run-tracker:
