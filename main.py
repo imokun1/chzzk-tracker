@@ -4,6 +4,7 @@ import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -17,11 +18,8 @@ SCOPES = [
 ]
 
 
-from datetime import datetime, timedelta
-
 def now_str():
-    korea_time = datetime.utcnow() + timedelta(hours=9)
-    return korea_time.strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def to_int(value):
@@ -72,7 +70,7 @@ def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
         return 0
 
     rows = snapshots[1:]
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=days)
 
     rows_to_archive = []
     row_numbers_to_delete = []
@@ -214,7 +212,6 @@ try:
 
     print("추적 대상 채널 수:", len(target_channel_ids))
 
-    # 1. 팔로워 수 기록
     follower_collected_count = 0
     latest_followers_by_channel_id = {}
 
@@ -238,7 +235,6 @@ try:
         except Exception as follower_error:
             print("팔로워 기록 실패:", channel_id, follower_error)
 
-    # 2. 현재 라이브 목록 조회
     url = "https://openapi.chzzk.naver.com/open/v1/lives?size=20"
 
     headers = {
@@ -262,7 +258,6 @@ try:
     updated_session_count = 0
     ended_session_count = 0
 
-    # 3. 현재 방송 중인 라이브 기록
     for live in lives:
         channel_id = live.get("channelId")
 
@@ -317,8 +312,6 @@ try:
             sessions_ws.update_cell(existing_session_row_number, 12, tags)
 
             updated_session_count += 1
-            print("세션 업데이트:", channel_name, "/", live_title)
-            print("최고 시청자:", peak_viewers, "평균 시청자:", average_viewers)
 
         else:
             sessions_ws.append_row([
@@ -338,10 +331,7 @@ try:
             ])
 
             created_session_count += 1
-            print("새 세션 생성:", channel_name, "/", live_title)
-            print("최고 시청자:", peak_viewers, "평균 시청자:", average_viewers)
 
-    # 4. 방송 종료 감지
     sessions = sessions_ws.get_all_records()
     snapshots = snapshots_ws.get_all_records()
 
@@ -377,9 +367,7 @@ try:
             sessions_ws.update_cell(index, 8, duration_minutes)
 
             ended_session_count += 1
-            print("방송 종료 처리:", session.get("channel_name"), "/", session.get("live_title"))
 
-    # 5. creators 현재 상태 업데이트
     sessions = sessions_ws.get_all_records()
 
     for channel_id in target_channel_ids:
@@ -415,9 +403,6 @@ try:
             checked_at=run_time
         )
 
-        print("creators 상태 업데이트:", channel_id)
-
-    # 6. 오래된 live_snapshots 아카이브
     archived_count = archive_old_snapshots(snapshots_ws, archive_ws, days=30)
 
     logs_ws.append_row([
