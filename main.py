@@ -1,86 +1,279 @@
+"""
+CHZZK Tracker - 버튜버 활동 데이터 수집 스크립트
+GitHub Actions 또는 로컬에서 주기적으로 실행되어
+치지직 공식 API로 채널 정보 / 라이브 정보를 수집하고
+Google Sheets에 누적 저장합니다.
+"""
+
 import os
+import json
+import time
+import traceback
 import requests
 import gspread
-from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
-load_dotenv()
+# 로컬 .env 사용 시에만 동작 (Actions에선 패스)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
+
+# ============================================================
+# 설정
+# ============================================================
 CLIENT_ID = os.getenv("CHZZK_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CHZZK_CLIENT_SECRET")
 SHEET_NAME = "치지직_버튜버_활동기록"
+GOOGLE_CREDS_FILE = "google_credentials.json"
+GOOGLE_CREDS_ENV = "GOOGLE_CREDENTIALS_JSON"  # 환경변수로도 받을 수 있게
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
 ]
 
+KST = timezone(timedelta(hours=9))
 
+# 공식 API endpoints
+CHZZK_API_BASE = "https://openapi.chzzk.naver.com/open/v1"
+LIVES_ENDPOINT = f"{CHZZK_API_BASE}/lives"
+CHANNELS_ENDPOINT = f"{CHZZK_API_BASE}/channels"
+
+# API 호출 시 재시도 횟수
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # 초
+
+
+# ============================================================
+# 유틸 함수
+# ============================================================
 def now_str():
-    return (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
+    """현재 시각 (KST) 문자열"""
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def to_int(value):
     try:
         return int(value)
-    except:
+    except (TypeError, ValueError):
         return 0
+
+
+def is_truthy(value):
+    """시트의 is_active 같은 boolean 값을 안전하게 판별"""
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    return str(value).strip().lower() == "true"
 
 
 def parse_datetime(value):
+    """다양한 포맷의 시간 문자열을 naive datetime으로 변환"""
     if not value:
         return None
-
     value = str(value).strip()
-
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
-    except:
+    except (ValueError, TypeError):
         pass
-
     try:
         return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
-    except:
+    except (ValueError, TypeError):
         return None
 
 
-def calculate_viewer_stats(snapshots, live_id):
-    viewers_list = []
+def get_header_map(worksheet):
+    """헤더 행을 읽어서 {컬럼명: 열 번호(1-indexed)} 딕셔너리 반환"""
+    headers = worksheet.row_values(1)
+    return {header: index + 1 for index, header in enumerate(headers)}
 
-    for snapshot in snapshots:
-        if str(snapshot.get("live_id")) == str(live_id):
-            viewers = to_int(snapshot.get("current_viewers"))
-            viewers_list.append(viewers)
 
+def col_letter(col_number):
+    """열 번호(1=A)를 알파벳으로 변환 (배치 업데이트 range용)"""
+    result = ""
+    while col_number > 0:
+        col_number, remainder = divmod(col_number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+# ============================================================
+# Google Sheets 인증
+# ============================================================
+def get_sheets_client():
+    """
+    환경변수 GOOGLE_CREDENTIALS_JSON이 있으면 그걸로,
+    없으면 google_credentials.json 파일로 인증.
+    """
+    creds_env = os.getenv(GOOGLE_CREDS_ENV)
+    if creds_env:
+        info = json.loads(creds_env)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+# ============================================================
+# 치지직 API 호출
+# ============================================================
+def chzzk_request(url, params=None):
+    """공식 API 요청 (재시도 포함)"""
+    headers = {
+        "Client-Id": CLIENT_ID,
+        "Client-Secret": CLIENT_SECRET,
+        "Content-Type": "application/json",
+    }
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=15)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BACKOFF * (attempt + 1))
+            else:
+                raise last_error
+
+
+def get_channels_info(channel_ids):
+    """
+    공식 API로 여러 채널 정보를 한 번에 조회.
+    응답: 채널별 channelId, channelName, followerCount 등.
+    """
+    if not channel_ids:
+        return {}
+
+    # 공식 API는 channelIds 파라미터를 콤마로 묶거나 다중 전달
+    # 안전하게 청크로 나눠 호출 (100개씩 권장)
+    result = {}
+    chunk_size = 20
+    for i in range(0, len(channel_ids), chunk_size):
+        chunk = channel_ids[i:i + chunk_size]
+        params = {"channelIds": ",".join(chunk)}
+        data = chzzk_request(CHANNELS_ENDPOINT, params=params)
+        items = data.get("content", {}).get("data", [])
+        for item in items:
+            cid = item.get("channelId")
+            if cid:
+                result[cid] = {
+                    "channel_id": cid,
+                    "channel_name": item.get("channelName", ""),
+                    "follower_count": to_int(item.get("followerCount")),
+                }
+    return result
+
+
+def get_all_lives(max_pages=10):
+    """
+    라이브 목록을 페이지네이션으로 가져옴.
+    공식 API는 한 번에 20개만 주므로 next 토큰으로 페이지 넘김.
+    max_pages 만큼 (최대 20*max_pages 개) 조회.
+    """
+    all_lives = []
+    next_token = None
+
+    for _ in range(max_pages):
+        params = {"size": 20}
+        if next_token:
+            params["next"] = next_token
+
+        data = chzzk_request(LIVES_ENDPOINT, params=params)
+        content = data.get("content", {})
+        lives = content.get("data", [])
+        all_lives.extend(lives)
+
+        next_token = content.get("page", {}).get("next")
+        if not next_token:
+            break
+
+    return all_lives
+
+
+# ============================================================
+# 데이터 처리
+# ============================================================
+def calculate_viewer_stats(snapshots_cache, live_id):
+    """메모리에 들고 있는 스냅샷 리스트에서 peak/avg 시청자 계산"""
+    viewers_list = [
+        to_int(s.get("current_viewers"))
+        for s in snapshots_cache
+        if str(s.get("live_id")) == str(live_id)
+    ]
     if not viewers_list:
         return 0, 0
-
-    peak_viewers = max(viewers_list)
-    average_viewers = round(sum(viewers_list) / len(viewers_list))
-
-    return peak_viewers, average_viewers
+    return max(viewers_list), round(sum(viewers_list) / len(viewers_list))
 
 
+def calculate_creator_summary(sessions_cache, channel_id):
+    """채널의 전체 방송 수, 평균 방송 시간, 마지막 방송 시간 계산"""
+    channel_sessions = [
+        s for s in sessions_cache
+        if str(s.get("channel_id")) == str(channel_id)
+    ]
+    total = len(channel_sessions)
+    durations = []
+    last_live_time = ""
+
+    for s in channel_sessions:
+        start = str(s.get("start_time", "")).strip()
+        dur = to_int(s.get("duration_minutes"))
+        if start and (not last_live_time or start > last_live_time):
+            last_live_time = start
+        if dur > 0:
+            durations.append(dur)
+
+    avg = round(sum(durations) / len(durations)) if durations else ""
+    return total, avg, last_live_time
+
+
+# ============================================================
+# 배치 업데이트 헬퍼
+# ============================================================
+def make_update(worksheet_title, row, col, value):
+    """gspread batch_update용 단일 셀 업데이트 객체 생성"""
+    return {
+        "range": f"'{worksheet_title}'!{col_letter(col)}{row}",
+        "values": [[value]],
+    }
+
+
+def flush_updates(spreadsheet, updates):
+    """누적한 update들을 batch_update로 한 번에 전송"""
+    if not updates:
+        return
+    # gspread의 values_batch_update 사용
+    spreadsheet.values_batch_update({
+        "valueInputOption": "USER_ENTERED",
+        "data": updates,
+    })
+
+
+# ============================================================
+# 아카이브
+# ============================================================
 def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
-    snapshots = snapshots_ws.get_all_values()
-
-    if len(snapshots) <= 1:
+    """30일 이상 지난 스냅샷을 archive로 이동"""
+    all_values = snapshots_ws.get_all_values()
+    if len(all_values) <= 1:
         return 0
 
-    rows = snapshots[1:]
-    cutoff = (datetime.utcnow() + timedelta(hours=9)) - timedelta(days=days)
-
+    cutoff = datetime.now(KST).replace(tzinfo=None) - timedelta(days=days)
     rows_to_archive = []
     row_numbers_to_delete = []
 
-    for i, row in enumerate(rows, start=2):
+    for i, row in enumerate(all_values[1:], start=2):
         if len(row) < 2:
             continue
-
-        snapshot_time_raw = row[1]
-        snapshot_dt = parse_datetime(snapshot_time_raw)
-
+        snapshot_dt = parse_datetime(row[1])
         if snapshot_dt and snapshot_dt < cutoff:
             rows_to_archive.append(row)
             row_numbers_to_delete.append(i)
@@ -88,348 +281,290 @@ def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
     if not rows_to_archive:
         return 0
 
-    archive_ws.append_rows(rows_to_archive)
-
+    archive_ws.append_rows(rows_to_archive, value_input_option="USER_ENTERED")
     for row_number in reversed(row_numbers_to_delete):
         snapshots_ws.delete_rows(row_number)
 
     return len(rows_to_archive)
 
 
-def get_channel_info(channel_id):
-    url = f"https://api.chzzk.naver.com/service/v1/channels/{channel_id}"
+# ============================================================
+# 메인 로직
+# ============================================================
+def main():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise RuntimeError("CHZZK_CLIENT_ID / CHZZK_CLIENT_SECRET 환경변수가 비어있습니다.")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    client = get_sheets_client()
+    sheet = client.open(SHEET_NAME)
 
-    response = requests.get(url, headers=headers, timeout=15)
-    data = response.json()
+    creators_ws = sheet.worksheet("creators")
+    snapshots_ws = sheet.worksheet("live_snapshots")
+    archive_ws = sheet.worksheet("live_snapshots_archive")
+    sessions_ws = sheet.worksheet("live_sessions")
+    followers_ws = sheet.worksheet("follower_snapshots")
+    logs_ws = sheet.worksheet("collection_logs")
 
-    content = data.get("content", {})
+    run_time = now_str()
 
-    return {
-        "channel_id": content.get("channelId"),
-        "channel_name": content.get("channelName"),
-        "follower_count": to_int(content.get("followerCount")),
-    }
-
-
-def get_header_map(worksheet):
-    headers = worksheet.row_values(1)
-    return {header: index + 1 for index, header in enumerate(headers)}
-
-
-def update_creator_status(
-    creators_ws,
-    row_number,
-    header_map,
-    is_live,
-    live_title,
-    current_viewers,
-    current_followers,
-    last_live_time,
-    total_live_count,
-    avg_live_duration,
-    checked_at
-):
-    updates = {
-        "current_live_status": "TRUE" if is_live else "FALSE",
-        "current_live_title": live_title,
-        "current_viewers": current_viewers,
-        "current_followers": current_followers,
-        "last_live_time": last_live_time,
-        "total_live_count": total_live_count,
-        "avg_live_duration": avg_live_duration,
-        "last_checked_at": checked_at,
-    }
-
-    for column_name, value in updates.items():
-        col = header_map.get(column_name)
-        if col:
-            creators_ws.update_cell(row_number, col, value)
-
-
-def calculate_creator_summary(sessions, channel_id):
-    channel_sessions = []
-
-    for session in sessions:
-        if str(session.get("channel_id")) == str(channel_id):
-            channel_sessions.append(session)
-
-    total_live_count = len(channel_sessions)
-
-    durations = []
-    last_live_time = ""
-
-    for session in channel_sessions:
-        start_time = str(session.get("start_time")).strip()
-        duration = to_int(session.get("duration_minutes"))
-
-        if start_time and (not last_live_time or start_time > last_live_time):
-            last_live_time = start_time
-
-        if duration > 0:
-            durations.append(duration)
-
-    avg_live_duration = ""
-
-    if durations:
-        avg_live_duration = round(sum(durations) / len(durations))
-
-    return total_live_count, avg_live_duration, last_live_time
-
-
-creds = Credentials.from_service_account_file("google_credentials.json", scopes=SCOPES)
-client = gspread.authorize(creds)
-
-sheet = client.open(SHEET_NAME)
-
-creators_ws = sheet.worksheet("creators")
-snapshots_ws = sheet.worksheet("live_snapshots")
-archive_ws = sheet.worksheet("live_snapshots_archive")
-sessions_ws = sheet.worksheet("live_sessions")
-followers_ws = sheet.worksheet("follower_snapshots")
-logs_ws = sheet.worksheet("collection_logs")
-
-run_time = now_str()
-
-try:
+    # --- 1단계: 시트 데이터 일괄 로드 (이후 메모리에서만 작업) ---
     creators = creators_ws.get_all_records()
     creator_header_map = get_header_map(creators_ws)
+    sessions_cache = sessions_ws.get_all_records()
+    snapshots_cache = snapshots_ws.get_all_records()
 
     target_channel_ids = []
     creator_rows_by_channel_id = {}
 
     for index, creator in enumerate(creators, start=2):
-        if str(creator.get("is_active")).upper() == "TRUE":
-            channel_id = str(creator.get("channel_id")).strip()
-
+        if is_truthy(creator.get("is_active")):
+            channel_id = str(creator.get("channel_id", "")).strip()
             if channel_id:
                 target_channel_ids.append(channel_id)
                 creator_rows_by_channel_id[channel_id] = index
 
-    print("추적 대상 채널 수:", len(target_channel_ids))
+    print(f"추적 대상 채널 수: {len(target_channel_ids)}")
+    if not target_channel_ids:
+        print("추적 대상이 없습니다. 종료.")
+        logs_ws.append_row(["", run_time, "SUCCESS", 0, "no targets", ""])
+        return
 
+    # --- 2단계: 공식 API로 채널 정보(팔로워 포함) 일괄 조회 ---
     follower_collected_count = 0
     latest_followers_by_channel_id = {}
+    follower_rows_to_append = []
 
-    for channel_id in target_channel_ids:
-        try:
-            channel_info = get_channel_info(channel_id)
+    try:
+        channels_info = get_channels_info(target_channel_ids)
+        for cid, info in channels_info.items():
+            follower_rows_to_append.append([
+                run_time,
+                info["channel_id"],
+                info["channel_name"],
+                info["follower_count"],
+            ])
+            latest_followers_by_channel_id[cid] = info["follower_count"]
+            follower_collected_count += 1
+            print(f"팔로워 기록: {info['channel_name']} {info['follower_count']}")
 
-            if channel_info["channel_id"]:
-                followers_ws.append_row([
-                    run_time,
-                    channel_info["channel_id"],
-                    channel_info["channel_name"],
-                    channel_info["follower_count"]
-                ])
+        # 한 번에 append
+        if follower_rows_to_append:
+            followers_ws.append_rows(
+                follower_rows_to_append,
+                value_input_option="USER_ENTERED",
+            )
+    except Exception as e:
+        print(f"채널 정보 조회 실패: {e}")
+        traceback.print_exc()
 
-                latest_followers_by_channel_id[channel_id] = channel_info["follower_count"]
+    # --- 3단계: 라이브 목록 조회 (페이지네이션) ---
+    try:
+        lives = get_all_lives(max_pages=10)
+        print(f"전체 라이브 수신: {len(lives)}")
+    except Exception as e:
+        print(f"라이브 목록 조회 실패: {e}")
+        traceback.print_exc()
+        lives = []
 
-                follower_collected_count += 1
-                print("팔로워 기록:", channel_info["channel_name"], channel_info["follower_count"])
-
-        except Exception as follower_error:
-            print("팔로워 기록 실패:", channel_id, follower_error)
-
-    url = "https://openapi.chzzk.naver.com/open/v1/lives?size=20"
-
-    headers = {
-        "Client-Id": CLIENT_ID,
-        "Client-Secret": CLIENT_SECRET,
-    }
-
-    response = requests.get(url, headers=headers, timeout=15)
-    print("치지직 API 상태 코드:", response.status_code)
-
-    data = response.json()
-    lives = data.get("content", {}).get("data", [])
+    # --- 4단계: 추적 대상 라이브만 필터 ---
+    target_set = set(target_channel_ids)
+    target_lives = [l for l in lives if l.get("channelId") in target_set]
+    print(f"추적 대상 중 라이브 중: {len(target_lives)}")
 
     current_live_ids = set()
     live_by_channel_id = {}
-
-    sessions = sessions_ws.get_all_records()
+    snapshot_rows_to_append = []
+    session_rows_to_append = []
+    session_updates = []
 
     collected_count = 0
     created_session_count = 0
     updated_session_count = 0
     ended_session_count = 0
 
-    for live in lives:
+    # --- 5단계: 라이브 데이터 처리 (스냅샷 + 세션) ---
+    for live in target_lives:
         channel_id = live.get("channelId")
-
-        if channel_id not in target_channel_ids:
-            continue
-
-        live_by_channel_id[channel_id] = live
-
         live_id = str(live.get("liveId"))
         current_live_ids.add(live_id)
+        live_by_channel_id[channel_id] = live
 
-        channel_name = live.get("channelName")
-        live_title = live.get("liveTitle")
-        category = live.get("liveCategoryValue")
+        channel_name = live.get("channelName", "")
+        live_title = live.get("liveTitle", "")
+        category = live.get("liveCategoryValue", "")
         viewers = to_int(live.get("concurrentUserCount"))
         tags = ",".join(live.get("tags", [])) if live.get("tags") else ""
-        open_date = live.get("openDate")
-        thumbnail_url = live.get("thumbnailUrl")
+        open_date = live.get("openDate", "")
+        thumbnail_url = live.get("thumbnailUrl", "")
         snapshot_time = now_str()
 
-        snapshots_ws.append_row([
-            "",
-            snapshot_time,
-            channel_id,
-            channel_name,
-            live_id,
-            live_title,
-            category,
-            viewers,
-            tags,
-            open_date,
-            thumbnail_url,
-            "TRUE"
-        ])
-
+        # 스냅샷 row (나중에 한 번에 append)
+        snapshot_row = [
+            "", snapshot_time, channel_id, channel_name, live_id,
+            live_title, category, viewers, tags, open_date,
+            thumbnail_url, "TRUE",
+        ]
+        snapshot_rows_to_append.append(snapshot_row)
         collected_count += 1
 
-        snapshots = snapshots_ws.get_all_records()
-        peak_viewers, average_viewers = calculate_viewer_stats(snapshots, live_id)
+        # 메모리 캐시에도 추가 (peak/avg 계산에 즉시 반영)
+        snapshots_cache.append({
+            "live_id": live_id,
+            "current_viewers": viewers,
+        })
 
-        existing_session_row_number = None
+        peak, avg = calculate_viewer_stats(snapshots_cache, live_id)
 
-        for index, session in enumerate(sessions, start=2):
-            if str(session.get("live_id")) == live_id:
-                existing_session_row_number = index
+        # 기존 세션이 있나 확인
+        existing_row = None
+        for idx, s in enumerate(sessions_cache, start=2):
+            if str(s.get("live_id")) == live_id:
+                existing_row = idx
                 break
 
-        if existing_session_row_number:
-            sessions_ws.update_cell(existing_session_row_number, 9, peak_viewers)
-            sessions_ws.update_cell(existing_session_row_number, 10, average_viewers)
-            sessions_ws.update_cell(existing_session_row_number, 11, category)
-            sessions_ws.update_cell(existing_session_row_number, 12, tags)
-
+        if existing_row:
+            # 컬럼 9~12 업데이트 (peak, avg, category, tags)
+            session_updates.append(make_update(sessions_ws.title, existing_row, 9, peak))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 10, avg))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 11, category))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 12, tags))
             updated_session_count += 1
-
         else:
-            sessions_ws.append_row([
-                "",
-                live_id,
-                channel_id,
-                channel_name,
-                live_title,
-                open_date,
-                "",
-                "",
-                peak_viewers,
-                average_viewers,
-                category,
-                tags,
-                run_time
-            ])
-
+            new_row = [
+                "", live_id, channel_id, channel_name, live_title,
+                open_date, "", "", peak, avg, category, tags, run_time,
+            ]
+            session_rows_to_append.append(new_row)
+            # 캐시에도 임시로 추가 (이후 종료 처리 시 참고)
+            sessions_cache.append({
+                "live_id": live_id,
+                "channel_id": channel_id,
+                "start_time": open_date,
+                "end_time": "",
+                "duration_minutes": "",
+            })
             created_session_count += 1
 
-    sessions = sessions_ws.get_all_records()
-    snapshots = snapshots_ws.get_all_records()
-
-    for index, session in enumerate(sessions, start=2):
-        session_live_id = str(session.get("live_id"))
-        session_channel_id = str(session.get("channel_id"))
-        end_time = str(session.get("end_time")).strip()
-
-        if session_channel_id not in target_channel_ids:
+    # --- 6단계: 종료된 세션 처리 ---
+    # current_live_ids에 없는데 sessions에서 end_time이 비어있는 세션 = 방송 종료된 것
+    for idx, s in enumerate(sessions_cache, start=2):
+        # append 예정인 신규 세션은 idx가 실제 시트와 어긋나므로 스킵
+        if idx > len(sessions_cache) + 1 - len(session_rows_to_append):
             continue
+        session_channel_id = str(s.get("channel_id", ""))
+        session_live_id = str(s.get("live_id", ""))
+        end_time = str(s.get("end_time", "")).strip()
 
+        if session_channel_id not in target_set:
+            continue
         if end_time:
             continue
+        if not session_live_id:
+            continue
+        if session_live_id in current_live_ids:
+            # 아직 진행 중인 라이브 - peak/avg만 갱신 (위 단계에서 이미 처리됨)
+            continue
 
-        peak_viewers, average_viewers = calculate_viewer_stats(snapshots, session_live_id)
+        # 종료 처리
+        peak, avg = calculate_viewer_stats(snapshots_cache, session_live_id)
+        start_dt = parse_datetime(s.get("start_time"))
+        end_dt = parse_datetime(run_time)
+        duration_minutes = ""
+        if start_dt and end_dt:
+            duration_minutes = round((end_dt - start_dt).total_seconds() / 60)
 
-        if peak_viewers > 0:
-            sessions_ws.update_cell(index, 9, peak_viewers)
-            sessions_ws.update_cell(index, 10, average_viewers)
+        session_updates.append(make_update(sessions_ws.title, idx, 7, run_time))
+        session_updates.append(make_update(sessions_ws.title, idx, 8, duration_minutes))
+        if peak > 0:
+            session_updates.append(make_update(sessions_ws.title, idx, 9, peak))
+            session_updates.append(make_update(sessions_ws.title, idx, 10, avg))
+        ended_session_count += 1
 
-        if session_live_id and session_live_id not in current_live_ids:
-            ended_at = run_time
-            start_time_raw = session.get("start_time")
-            start_dt = parse_datetime(start_time_raw)
-            end_dt = parse_datetime(ended_at)
+    # --- 7단계: append할 행들 한 번에 추가 ---
+    if snapshot_rows_to_append:
+        snapshots_ws.append_rows(snapshot_rows_to_append, value_input_option="USER_ENTERED")
+    if session_rows_to_append:
+        sessions_ws.append_rows(session_rows_to_append, value_input_option="USER_ENTERED")
 
-            duration_minutes = ""
+    # --- 8단계: 세션 업데이트 일괄 적용 ---
+    flush_updates(sheet, session_updates)
 
-            if start_dt and end_dt:
-                duration_minutes = round((end_dt - start_dt).total_seconds() / 60)
-
-            sessions_ws.update_cell(index, 7, ended_at)
-            sessions_ws.update_cell(index, 8, duration_minutes)
-
-            ended_session_count += 1
-
-    sessions = sessions_ws.get_all_records()
+    # --- 9단계: creators 시트 상태 갱신 (배치) ---
+    # append된 신규 세션까지 반영하기 위해 다시 읽음 (1회만)
+    sessions_cache_refreshed = sessions_ws.get_all_records()
+    creator_updates = []
 
     for channel_id in target_channel_ids:
         row_number = creator_rows_by_channel_id.get(channel_id)
-
         if not row_number:
             continue
 
         live = live_by_channel_id.get(channel_id)
         is_live = live is not None
-
-        live_title = ""
-        current_viewers = 0
-
-        if is_live:
-            live_title = live.get("liveTitle")
-            current_viewers = to_int(live.get("concurrentUserCount"))
-
+        live_title = live.get("liveTitle", "") if is_live else ""
+        current_viewers = to_int(live.get("concurrentUserCount")) if is_live else 0
         current_followers = latest_followers_by_channel_id.get(channel_id, "")
-        total_live_count, avg_live_duration, last_live_time = calculate_creator_summary(sessions, channel_id)
 
-        update_creator_status(
-            creators_ws=creators_ws,
-            row_number=row_number,
-            header_map=creator_header_map,
-            is_live=is_live,
-            live_title=live_title,
-            current_viewers=current_viewers,
-            current_followers=current_followers,
-            last_live_time=last_live_time,
-            total_live_count=total_live_count,
-            avg_live_duration=avg_live_duration,
-            checked_at=run_time
+        total_live, avg_duration, last_live_time = calculate_creator_summary(
+            sessions_cache_refreshed, channel_id
         )
 
+        update_map = {
+            "current_live_status": "TRUE" if is_live else "FALSE",
+            "current_live_title": live_title,
+            "current_viewers": current_viewers,
+            "current_followers": current_followers,
+            "last_live_time": last_live_time,
+            "total_live_count": total_live,
+            "avg_live_duration": avg_duration,
+            "last_checked_at": run_time,
+        }
+
+        for col_name, val in update_map.items():
+            col = creator_header_map.get(col_name)
+            if col:
+                creator_updates.append(make_update(creators_ws.title, row_number, col, val))
+
+    flush_updates(sheet, creator_updates)
+
+    # --- 10단계: 아카이브 ---
     archived_count = archive_old_snapshots(snapshots_ws, archive_ws, days=30)
 
+    # --- 11단계: 로그 기록 ---
     logs_ws.append_row([
-        "",
-        run_time,
-        "SUCCESS",
-        collected_count,
-        "",
-        ""
-    ])
+        "", run_time, "SUCCESS", collected_count, "", "",
+    ], value_input_option="USER_ENTERED")
 
+    print("=" * 40)
     print("전체 완료!")
-    print("팔로워 기록 수:", follower_collected_count)
-    print("스냅샷 기록 수:", collected_count)
-    print("새 세션 수:", created_session_count)
-    print("업데이트 세션 수:", updated_session_count)
-    print("종료 처리 수:", ended_session_count)
-    print("아카이브 이동 수:", archived_count)
+    print(f"팔로워 기록 수: {follower_collected_count}")
+    print(f"스냅샷 기록 수: {collected_count}")
+    print(f"새 세션 수: {created_session_count}")
+    print(f"업데이트 세션 수: {updated_session_count}")
+    print(f"종료 처리 수: {ended_session_count}")
+    print(f"아카이브 이동 수: {archived_count}")
 
-except Exception as e:
-    logs_ws.append_row([
-        "",
-        run_time,
-        "ERROR",
-        0,
-        str(e),
-        ""
-    ])
 
-    print("에러 발생:")
-    print(e)
+# ============================================================
+# 실행
+# ============================================================
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # 에러가 나도 최소한 로그는 남기도록 시도
+        print("=" * 40)
+        print("에러 발생:")
+        print(e)
+        traceback.print_exc()
+        try:
+            client = get_sheets_client()
+            sheet = client.open(SHEET_NAME)
+            logs_ws = sheet.worksheet("collection_logs")
+            logs_ws.append_row(
+                ["", now_str(), "ERROR", 0, str(e)[:500], ""],
+                value_input_option="USER_ENTERED",
+            )
+        except Exception as log_err:
+            print(f"로그 기록도 실패: {log_err}")
+        raise  # GitHub Actions에서 실패로 표시되도록
