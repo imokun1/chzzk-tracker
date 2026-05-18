@@ -4,7 +4,6 @@ import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -19,7 +18,7 @@ SCOPES = [
 
 
 def now_str():
-    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+    return (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def to_int(value):
@@ -70,7 +69,7 @@ def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
         return 0
 
     rows = snapshots[1:]
-    cutoff = datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=days)
+    cutoff = (datetime.utcnow() + timedelta(hours=9)) - timedelta(days=days)
 
     rows_to_archive = []
     row_numbers_to_delete = []
