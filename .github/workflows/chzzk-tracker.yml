@@ -3,6 +3,10 @@ name: CHZZK Tracker
 on:
   workflow_dispatch:
 
+concurrency:
+  group: chzzk-tracker-singleton
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
