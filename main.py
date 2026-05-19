@@ -4,9 +4,11 @@ GitHub Actions 또는 로컬에서 주기적으로 실행되어
 치지직 공식 API로 채널 정보 / 라이브 정보를 수집하고
 Google Sheets에 누적 저장합니다.
 
-업데이트: 모든 시계열 시트에 agency, generation 컬럼 추가.
-creators 시트에서 매핑 정보를 읽어서 자동으로 채워줍니다.
-+ append 전후 시트 행 수를 로그로 출력 (디버깅용)
+업데이트:
+- 모든 시계열 시트에 agency, generation 컬럼 포함
+- live_snapshots, live_sessions, collection_logs, live_snapshots_archive
+  시트의 'id' 컬럼(A열) 제거. A열이 비어있어서 발생하는 append 위치
+  버그 해결.
 """
 
 import os
@@ -226,20 +228,6 @@ def flush_updates(spreadsheet, updates):
 
 
 # ============================================================
-# 시트 행 수 확인 (디버깅용)
-# ============================================================
-def count_data_rows(worksheet):
-    """시트의 실제 데이터 행 수 카운트 (헤더 제외)"""
-    try:
-        all_values = worksheet.get_all_values()
-        # 빈 행 제외하고 카운트
-        non_empty = [row for row in all_values if any(cell.strip() for cell in row)]
-        return len(non_empty)
-    except Exception:
-        return -1
-
-
-# ============================================================
 # 아카이브
 # ============================================================
 def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
@@ -251,10 +239,11 @@ def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
     rows_to_archive = []
     row_numbers_to_delete = []
 
+    # ★ id 컬럼 제거로 snapshot_time이 이제 A열(인덱스 0)
     for i, row in enumerate(all_values[1:], start=2):
-        if len(row) < 2:
+        if len(row) < 1:
             continue
-        snapshot_dt = parse_datetime(row[1])
+        snapshot_dt = parse_datetime(row[0])  # ★ 변경: row[1] → row[0]
         if snapshot_dt and snapshot_dt < cutoff:
             rows_to_archive.append(row)
             row_numbers_to_delete.append(i)
@@ -288,15 +277,6 @@ def main():
 
     run_time = now_str()
 
-    # --- 디버깅: 시작 시점 시트 상태 출력 ---
-    print("=" * 40)
-    print("[DEBUG] 실행 시작 시점 시트 행 수:")
-    print(f"[DEBUG] live_snapshots: {count_data_rows(snapshots_ws)}행")
-    print(f"[DEBUG] live_sessions: {count_data_rows(sessions_ws)}행")
-    print(f"[DEBUG] follower_snapshots: {count_data_rows(followers_ws)}행")
-    print(f"[DEBUG] collection_logs: {count_data_rows(logs_ws)}행")
-    print("=" * 40)
-
     # --- 1단계: 시트 데이터 일괄 로드 ---
     creators = creators_ws.get_all_records()
     creator_header_map = get_header_map(creators_ws)
@@ -321,7 +301,8 @@ def main():
     print(f"추적 대상 채널 수: {len(target_channel_ids)}")
     if not target_channel_ids:
         print("추적 대상이 없습니다. 종료.")
-        logs_ws.append_row(["", run_time, "SUCCESS", 0, "no targets", ""])
+        # ★ id 컬럼 제거: 5개 컬럼으로 축소
+        logs_ws.append_row([run_time, "SUCCESS", 0, "no targets", ""])
         return
 
     # --- 2단계: 공식 API로 채널 정보 일괄 조회 ---
@@ -346,12 +327,10 @@ def main():
             print(f"팔로워 기록: {info['channel_name']} {info['follower_count']}")
 
         if follower_rows_to_append:
-            print(f"[DEBUG] follower_snapshots에 {len(follower_rows_to_append)}행 append 시도")
             followers_ws.append_rows(
                 follower_rows_to_append,
                 value_input_option="USER_ENTERED",
             )
-            print(f"[DEBUG] follower_snapshots append 완료, 현재 행 수: {count_data_rows(followers_ws)}")
     except Exception as e:
         print(f"채널 정보 조회 실패: {e}")
         traceback.print_exc()
@@ -401,8 +380,9 @@ def main():
         agency = meta.get("agency", "")
         generation = meta.get("generation", "")
 
+        # ★ id 컬럼 제거: 13개 컬럼 (snapshot_time이 첫 컬럼)
         snapshot_row = [
-            "", snapshot_time, channel_id, channel_name, live_id,
+            snapshot_time, channel_id, channel_name, live_id,
             live_title, category, viewers, tags, open_date,
             thumbnail_url, "TRUE",
             agency, generation,
@@ -423,15 +403,19 @@ def main():
                 existing_row = idx
                 break
 
+        # ★ id 컬럼 제거로 모든 컬럼 번호가 1씩 감소
+        # 기존: 9(peak), 10(avg), 11(category), 12(tags)
+        # 변경: 8(peak), 9(avg), 10(category), 11(tags)
         if existing_row:
-            session_updates.append(make_update(sessions_ws.title, existing_row, 9, peak))
-            session_updates.append(make_update(sessions_ws.title, existing_row, 10, avg))
-            session_updates.append(make_update(sessions_ws.title, existing_row, 11, category))
-            session_updates.append(make_update(sessions_ws.title, existing_row, 12, tags))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 8, peak))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 9, avg))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 10, category))
+            session_updates.append(make_update(sessions_ws.title, existing_row, 11, tags))
             updated_session_count += 1
         else:
+            # ★ id 컬럼 제거: 14개 컬럼 (live_id가 첫 컬럼)
             new_row = [
-                "", live_id, channel_id, channel_name, live_title,
+                live_id, channel_id, channel_name, live_title,
                 open_date, "", "", peak, avg, category, tags, run_time,
                 agency, generation,
             ]
@@ -469,25 +453,21 @@ def main():
         if start_dt and end_dt:
             duration_minutes = round((end_dt - start_dt).total_seconds() / 60)
 
-        session_updates.append(make_update(sessions_ws.title, idx, 7, run_time))
-        session_updates.append(make_update(sessions_ws.title, idx, 8, duration_minutes))
+        # ★ id 컬럼 제거로 컬럼 번호가 1씩 감소
+        # 기존: 7(end_time), 8(duration), 9(peak), 10(avg)
+        # 변경: 6(end_time), 7(duration), 8(peak), 9(avg)
+        session_updates.append(make_update(sessions_ws.title, idx, 6, run_time))
+        session_updates.append(make_update(sessions_ws.title, idx, 7, duration_minutes))
         if peak > 0:
-            session_updates.append(make_update(sessions_ws.title, idx, 9, peak))
-            session_updates.append(make_update(sessions_ws.title, idx, 10, avg))
+            session_updates.append(make_update(sessions_ws.title, idx, 8, peak))
+            session_updates.append(make_update(sessions_ws.title, idx, 9, avg))
         ended_session_count += 1
 
     # --- 7단계: append할 행들 한 번에 추가 ---
     if snapshot_rows_to_append:
-        print(f"[DEBUG] live_snapshots에 {len(snapshot_rows_to_append)}행 append 시도")
-        print(f"[DEBUG] append 전 live_snapshots 행 수: {count_data_rows(snapshots_ws)}")
         snapshots_ws.append_rows(snapshot_rows_to_append, value_input_option="USER_ENTERED")
-        print(f"[DEBUG] append 후 live_snapshots 행 수: {count_data_rows(snapshots_ws)}")
-
     if session_rows_to_append:
-        print(f"[DEBUG] live_sessions에 {len(session_rows_to_append)}행 append 시도")
-        print(f"[DEBUG] append 전 live_sessions 행 수: {count_data_rows(sessions_ws)}")
         sessions_ws.append_rows(session_rows_to_append, value_input_option="USER_ENTERED")
-        print(f"[DEBUG] append 후 live_sessions 행 수: {count_data_rows(sessions_ws)}")
 
     # --- 8단계: 세션 업데이트 일괄 적용 ---
     flush_updates(sheet, session_updates)
@@ -529,12 +509,10 @@ def main():
     archived_count = archive_old_snapshots(snapshots_ws, archive_ws, days=30)
 
     # --- 11단계: 로그 기록 ---
-    print(f"[DEBUG] collection_logs에 1행 append 시도")
-    print(f"[DEBUG] append 전 collection_logs 행 수: {count_data_rows(logs_ws)}")
+    # ★ id 컬럼 제거: 5개 컬럼으로 축소
     logs_ws.append_row([
-        "", run_time, "SUCCESS", collected_count, "", "",
+        run_time, "SUCCESS", collected_count, "", "",
     ], value_input_option="USER_ENTERED")
-    print(f"[DEBUG] append 후 collection_logs 행 수: {count_data_rows(logs_ws)}")
 
     print("=" * 40)
     print("전체 완료!")
@@ -561,8 +539,9 @@ if __name__ == "__main__":
             client = get_sheets_client()
             sheet = client.open(SHEET_NAME)
             logs_ws = sheet.worksheet("collection_logs")
+            # ★ id 컬럼 제거: 5개 컬럼으로 축소
             logs_ws.append_row(
-                ["", now_str(), "ERROR", 0, str(e)[:500], ""],
+                [now_str(), "ERROR", 0, str(e)[:500], ""],
                 value_input_option="USER_ENTERED",
             )
         except Exception as log_err:
