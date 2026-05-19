@@ -6,6 +6,7 @@ Google Sheets에 누적 저장합니다.
 
 업데이트: 모든 시계열 시트에 agency, generation 컬럼 추가.
 creators 시트에서 매핑 정보를 읽어서 자동으로 채워줍니다.
++ append 전후 시트 행 수를 로그로 출력 (디버깅용)
 """
 
 import os
@@ -41,7 +42,6 @@ SCOPES = [
 
 KST = timezone(timedelta(hours=9))
 
-# 공식 API endpoints
 CHZZK_API_BASE = "https://openapi.chzzk.naver.com/open/v1"
 LIVES_ENDPOINT = f"{CHZZK_API_BASE}/lives"
 CHANNELS_ENDPOINT = f"{CHZZK_API_BASE}/channels"
@@ -226,6 +226,20 @@ def flush_updates(spreadsheet, updates):
 
 
 # ============================================================
+# 시트 행 수 확인 (디버깅용)
+# ============================================================
+def count_data_rows(worksheet):
+    """시트의 실제 데이터 행 수 카운트 (헤더 제외)"""
+    try:
+        all_values = worksheet.get_all_values()
+        # 빈 행 제외하고 카운트
+        non_empty = [row for row in all_values if any(cell.strip() for cell in row)]
+        return len(non_empty)
+    except Exception:
+        return -1
+
+
+# ============================================================
 # 아카이브
 # ============================================================
 def archive_old_snapshots(snapshots_ws, archive_ws, days=30):
@@ -274,6 +288,15 @@ def main():
 
     run_time = now_str()
 
+    # --- 디버깅: 시작 시점 시트 상태 출력 ---
+    print("=" * 40)
+    print("[DEBUG] 실행 시작 시점 시트 행 수:")
+    print(f"[DEBUG] live_snapshots: {count_data_rows(snapshots_ws)}행")
+    print(f"[DEBUG] live_sessions: {count_data_rows(sessions_ws)}행")
+    print(f"[DEBUG] follower_snapshots: {count_data_rows(followers_ws)}행")
+    print(f"[DEBUG] collection_logs: {count_data_rows(logs_ws)}행")
+    print("=" * 40)
+
     # --- 1단계: 시트 데이터 일괄 로드 ---
     creators = creators_ws.get_all_records()
     creator_header_map = get_header_map(creators_ws)
@@ -282,7 +305,6 @@ def main():
 
     target_channel_ids = []
     creator_rows_by_channel_id = {}
-    # ★ 새로 추가: channel_id → {agency, generation} 매핑
     creator_meta_by_channel_id = {}
 
     for index, creator in enumerate(creators, start=2):
@@ -291,7 +313,6 @@ def main():
             if channel_id:
                 target_channel_ids.append(channel_id)
                 creator_rows_by_channel_id[channel_id] = index
-                # ★ agency, generation 정보 저장
                 creator_meta_by_channel_id[channel_id] = {
                     "agency": str(creator.get("agency", "")).strip(),
                     "generation": str(creator.get("generation", "")).strip(),
@@ -303,7 +324,7 @@ def main():
         logs_ws.append_row(["", run_time, "SUCCESS", 0, "no targets", ""])
         return
 
-    # --- 2단계: 공식 API로 채널 정보(팔로워 포함) 일괄 조회 ---
+    # --- 2단계: 공식 API로 채널 정보 일괄 조회 ---
     follower_collected_count = 0
     latest_followers_by_channel_id = {}
     follower_rows_to_append = []
@@ -311,30 +332,31 @@ def main():
     try:
         channels_info = get_channels_info(target_channel_ids)
         for cid, info in channels_info.items():
-            # ★ agency, generation 정보 같이 저장
             meta = creator_meta_by_channel_id.get(cid, {})
             follower_rows_to_append.append([
                 run_time,
                 info["channel_id"],
                 info["channel_name"],
                 info["follower_count"],
-                meta.get("agency", ""),       # ★ agency
-                meta.get("generation", ""),   # ★ generation
+                meta.get("agency", ""),
+                meta.get("generation", ""),
             ])
             latest_followers_by_channel_id[cid] = info["follower_count"]
             follower_collected_count += 1
             print(f"팔로워 기록: {info['channel_name']} {info['follower_count']}")
 
         if follower_rows_to_append:
+            print(f"[DEBUG] follower_snapshots에 {len(follower_rows_to_append)}행 append 시도")
             followers_ws.append_rows(
                 follower_rows_to_append,
                 value_input_option="USER_ENTERED",
             )
+            print(f"[DEBUG] follower_snapshots append 완료, 현재 행 수: {count_data_rows(followers_ws)}")
     except Exception as e:
         print(f"채널 정보 조회 실패: {e}")
         traceback.print_exc()
 
-    # --- 3단계: 라이브 목록 조회 (페이지네이션) ---
+    # --- 3단계: 라이브 목록 조회 ---
     try:
         lives = get_all_lives(max_pages=10)
         print(f"전체 라이브 수신: {len(lives)}")
@@ -359,7 +381,7 @@ def main():
     updated_session_count = 0
     ended_session_count = 0
 
-    # --- 5단계: 라이브 데이터 처리 (스냅샷 + 세션) ---
+    # --- 5단계: 라이브 데이터 처리 ---
     for live in target_lives:
         channel_id = live.get("channelId")
         live_id = str(live.get("liveId"))
@@ -375,17 +397,15 @@ def main():
         thumbnail_url = live.get("thumbnailUrl", "")
         snapshot_time = now_str()
 
-        # ★ agency, generation 가져오기
         meta = creator_meta_by_channel_id.get(channel_id, {})
         agency = meta.get("agency", "")
         generation = meta.get("generation", "")
 
-        # 스냅샷 row (14개 컬럼: 기존 12 + agency + generation)
         snapshot_row = [
             "", snapshot_time, channel_id, channel_name, live_id,
             live_title, category, viewers, tags, open_date,
             thumbnail_url, "TRUE",
-            agency, generation,  # ★ 추가
+            agency, generation,
         ]
         snapshot_rows_to_append.append(snapshot_row)
         collected_count += 1
@@ -410,11 +430,10 @@ def main():
             session_updates.append(make_update(sessions_ws.title, existing_row, 12, tags))
             updated_session_count += 1
         else:
-            # 새 세션 row (15개 컬럼: 기존 13 + agency + generation)
             new_row = [
                 "", live_id, channel_id, channel_name, live_title,
                 open_date, "", "", peak, avg, category, tags, run_time,
-                agency, generation,  # ★ 추가
+                agency, generation,
             ]
             session_rows_to_append.append(new_row)
             sessions_cache.append({
@@ -459,14 +478,21 @@ def main():
 
     # --- 7단계: append할 행들 한 번에 추가 ---
     if snapshot_rows_to_append:
+        print(f"[DEBUG] live_snapshots에 {len(snapshot_rows_to_append)}행 append 시도")
+        print(f"[DEBUG] append 전 live_snapshots 행 수: {count_data_rows(snapshots_ws)}")
         snapshots_ws.append_rows(snapshot_rows_to_append, value_input_option="USER_ENTERED")
+        print(f"[DEBUG] append 후 live_snapshots 행 수: {count_data_rows(snapshots_ws)}")
+
     if session_rows_to_append:
+        print(f"[DEBUG] live_sessions에 {len(session_rows_to_append)}행 append 시도")
+        print(f"[DEBUG] append 전 live_sessions 행 수: {count_data_rows(sessions_ws)}")
         sessions_ws.append_rows(session_rows_to_append, value_input_option="USER_ENTERED")
+        print(f"[DEBUG] append 후 live_sessions 행 수: {count_data_rows(sessions_ws)}")
 
     # --- 8단계: 세션 업데이트 일괄 적용 ---
     flush_updates(sheet, session_updates)
 
-    # --- 9단계: creators 시트 상태 갱신 (배치) ---
+    # --- 9단계: creators 시트 상태 갱신 ---
     sessions_cache_refreshed = sessions_ws.get_all_records()
     creator_updates = []
 
@@ -503,9 +529,12 @@ def main():
     archived_count = archive_old_snapshots(snapshots_ws, archive_ws, days=30)
 
     # --- 11단계: 로그 기록 ---
+    print(f"[DEBUG] collection_logs에 1행 append 시도")
+    print(f"[DEBUG] append 전 collection_logs 행 수: {count_data_rows(logs_ws)}")
     logs_ws.append_row([
         "", run_time, "SUCCESS", collected_count, "", "",
     ], value_input_option="USER_ENTERED")
+    print(f"[DEBUG] append 후 collection_logs 행 수: {count_data_rows(logs_ws)}")
 
     print("=" * 40)
     print("전체 완료!")
