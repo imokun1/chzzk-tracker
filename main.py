@@ -213,26 +213,18 @@ def calculate_viewer_stats(snapshots_cache, live_id):
     return max(viewers_list), round(sum(viewers_list) / len(viewers_list))
 
 
-def calculate_creator_summary(sessions_cache, channel_id):
-    """채널의 전체 방송 수, 평균 방송 시간, 마지막 방송 시간 계산"""
-    channel_sessions = [
-        s for s in sessions_cache
-        if str(s.get("channel_id")) == str(channel_id)
-    ]
-    total = len(channel_sessions)
-    durations = []
+def calculate_last_live_time(sessions_cache, channel_id):
+    """채널의 마지막 방송 시작 시간만 계산 (total_live_count, avg_live_duration은 Looker Studio에서 직접 집계)"""
     last_live_time = ""
 
-    for s in channel_sessions:
+    for s in sessions_cache:
+        if str(s.get("channel_id")) != str(channel_id):
+            continue
         start = str(s.get("start_time", "")).strip()
-        dur = to_int(s.get("duration_minutes"))
         if start and (not last_live_time or start > last_live_time):
             last_live_time = start
-        if dur > 0:
-            durations.append(dur)
 
-    avg = round(sum(durations) / len(durations)) if durations else ""
-    return total, avg, last_live_time
+    return last_live_time
 
 
 # ============================================================
@@ -505,9 +497,8 @@ def main():
         current_viewers = to_int(live.get("concurrentUserCount")) if is_live else 0
         current_followers = latest_followers_by_channel_id.get(channel_id, "")
 
-        total_live, avg_duration, last_live_time = calculate_creator_summary(
-            sessions_cache_refreshed, channel_id
-        )
+        # last_live_time만 계산 (total_live_count, avg_live_duration은 Looker Studio에서 직접 집계)
+        last_live_time = calculate_last_live_time(sessions_cache_refreshed, channel_id)
 
         update_map = {
             "current_live_status": "TRUE" if is_live else "FALSE",
@@ -515,8 +506,6 @@ def main():
             "current_viewers": current_viewers,
             "current_followers": current_followers,
             "last_live_time": last_live_time,
-            "total_live_count": total_live,
-            "avg_live_duration": avg_duration,
             "last_checked_at": run_time,
         }
 
