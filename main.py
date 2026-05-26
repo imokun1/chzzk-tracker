@@ -506,7 +506,7 @@ def main():
     flush_updates(sheet, creator_updates)
 
     # --- 10단계: 아카이브 ---
-    archived_count = archive_old_snapshots(snapshots_ws, archive_ws, days=30)
+    archived_count = archive_old_snapshots(snapshots_ws, archive_ws, days=366)
 
     # --- 11단계: 로그 기록 ---
     # ★ id 컬럼 제거: 5개 컬럼으로 축소
