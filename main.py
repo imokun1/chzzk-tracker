@@ -337,7 +337,7 @@ def main():
 
     # --- 3단계: 라이브 목록 조회 ---
     try:
-        lives = get_all_lives(max_pages=10)
+        lives = get_all_lives(max_pages=50)
         print(f"전체 라이브 수신: {len(lives)}")
     except Exception as e:
         print(f"라이브 목록 조회 실패: {e}")
